@@ -1,0 +1,89 @@
+# ---------------------------------------------------------------------------
+# Cribrix local stack: FastAPI service + PostgreSQL 16 with pgvector.
+# ---------------------------------------------------------------------------
+
+name: cribrix
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: cribrix-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cribrix}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cribrix}
+      POSTGRES_DB: ${POSTGRES_DB:-cribrix}
+      # Checksums catch silent page corruption; cheap insurance on a laptop
+      # that sleeps and wakes with an open connection pool.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      - "${CRIBRIX_DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Idempotent bootstrap: enables the vector extension on first init.
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # `pg_isready` alone returns true during initdb's temporary startup, so
+      # the API can connect and then get dropped. Probing the extension proves
+      # the database is genuinely ready for our workload.
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-cribrix} -d ${POSTGRES_DB:-cribrix} && psql -U ${POSTGRES_USER:-cribrix} -d ${POSTGRES_DB:-cribrix} -tAc \"SELECT 1 FROM pg_extension WHERE extname='vector'\" | grep -q 1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    shm_size: 256mb # HNSW index builds are memory-hungry
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - maintenance_work_mem=256MB # speeds up HNSW index construction
+      - -c
+      - max_connections=100
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: runtime
+    container_name: cribrix-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      CRIBRIX_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-cribrix}:${POSTGRES_PASSWORD:-cribrix}@db:5432/${POSTGRES_DB:-cribrix}
+      CRIBRIX_ENV: docker
+      CRIBRIX_LOG_LEVEL: ${CRIBRIX_LOG_LEVEL:-INFO}
+      CRIBRIX_LOG_JSON: ${CRIBRIX_LOG_JSON:-true}
+      CRIBRIX_JEV_MODE: ${CRIBRIX_JEV_MODE:-mock}
+      CRIBRIX_LLM_MODE: ${CRIBRIX_LLM_MODE:-mock}
+      CRIBRIX_JEV_API_KEY: ${CRIBRIX_JEV_API_KEY:-}
+      CRIBRIX_RELEVANCE_THRESHOLD: ${CRIBRIX_RELEVANCE_THRESHOLD:-0.7}
+      CRIBRIX_RETRIEVAL_TOP_K: ${CRIBRIX_RETRIEVAL_TOP_K:-20}
+      CRIBRIX_VERIFICATION_MODE: ${CRIBRIX_VERIFICATION_MODE:-atomic}
+      CRIBRIX_EMBEDDING_DIM: ${CRIBRIX_EMBEDDING_DIM:-1536}
+    ports:
+      - "${CRIBRIX_API_HOST:-127.0.0.1}:${CRIBRIX_API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    develop:
+      # `docker compose watch` — hot reload without rebuilding the image.
+      watch:
+        - action: sync
+          path: ./cribrix
+          target: /app/cribrix
+        - action: rebuild
+          path: ./pyproject.toml
+
+volumes:
+  pgdata:
+    driver: local
