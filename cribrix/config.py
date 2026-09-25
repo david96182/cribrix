@@ -14,6 +14,8 @@ from typing import Literal
 from pydantic import Field, PostgresDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEV_ENVIRONMENTS = frozenset({"local", "test", "docker"})
+
 
 class Settings(BaseSettings):
     """Runtime configuration, sourced from environment / `.env`."""
@@ -200,7 +202,20 @@ class Settings(BaseSettings):
     # --- App ----------------------------------------------------------------
     log_level: str = "INFO"
     log_json: bool = True
-    env: str = "local"
+    env: str = Field(
+        default="production",
+        description=(
+            "Deployment environment. Development conveniences (auto schema "
+            "creation, the unauthenticated /admin/reset endpoint) are enabled "
+            "only for 'local', 'test' and 'docker'. The default is the safe one: "
+            "a deployment that forgets to set CRIBRIX_ENV gets production behaviour."
+        ),
+    )
+
+    @property
+    def is_dev(self) -> bool:
+        """True in environments where destructive dev conveniences are allowed."""
+        return self.env in DEV_ENVIRONMENTS
 
     @field_validator("database_url")
     @classmethod

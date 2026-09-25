@@ -154,6 +154,17 @@ async def test_ingest_rejects_dimension_mismatch(client: AsyncClient, settings: 
     assert "dimension" in resp.json()["detail"].lower()
 
 
+async def test_admin_reset_is_refused_outside_dev(chunks: list[Chunk]) -> None:
+    """The destructive endpoint must be off unless explicitly in a dev environment."""
+    app.dependency_overrides[get_database] = lambda: _FakeDatabase()
+    app.dependency_overrides[get_settings] = lambda: Settings(env="production")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.post("/admin/reset")
+    app.dependency_overrides.clear()
+    assert resp.status_code == 403
+
+
 async def test_openapi_schema_is_generated(client: AsyncClient) -> None:
     resp = await client.get("/openapi.json")
     assert resp.status_code == 200

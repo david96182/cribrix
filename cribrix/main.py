@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     db.connect()
     # Convenience for local dev and the containerised demo. In production this
     # belongs in a reviewed Alembic migration, not in application startup.
-    if settings.env in {"local", "test", "docker"}:
+    if settings.is_dev:
         try:
             await db.create_schema()
         except Exception:
@@ -63,6 +63,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.llm = build_llm_client(settings)
     app.state.retriever = PgVectorRetriever(db, embedder)
 
+    if not settings.is_dev:
+        logger.info(
+            "startup.production_mode", note="/admin/reset disabled; schema not auto-created"
+        )
     logger.info(
         "startup.complete",
         env=settings.env,
@@ -273,7 +277,7 @@ async def reset_endpoint(
     destructive, unauthenticated endpoint that exists in production is an
     incident waiting to happen.
     """
-    if settings.env not in {"local", "test", "docker"}:
+    if not settings.is_dev:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"/admin/reset is disabled when CRIBRIX_ENV={settings.env!r}",

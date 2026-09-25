@@ -21,6 +21,13 @@ def test_defaults_are_sane() -> None:
     assert s.fail_open_on_verifier_error is False, "default must be fail-closed"
 
 
+def test_environment_defaults_to_production() -> None:
+    """Forgetting CRIBRIX_ENV must not enable /admin/reset or auto-migrations."""
+    assert Settings.model_fields["env"].default == "production"
+    assert Settings(env="production").is_dev is False
+    assert Settings(env="local").is_dev is True
+
+
 def test_sync_driver_is_rejected() -> None:
     """A sync DSN would block the event loop; fail at startup, not under load."""
     with pytest.raises(ValidationError, match="asyncpg"):
