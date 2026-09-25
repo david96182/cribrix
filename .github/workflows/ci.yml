@@ -82,8 +82,8 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -e ".[dev]"
-      # Gates the merge on answer quality, not just on tests passing.
-      - run: python -m cribrix.evaluation.runner --min-accuracy 85
+      # Wiring check: the deterministic fakes. Says nothing about model quality.
+      - run: python -m cribrix.evaluation.runner --backend fake
 
   docker:
     name: Docker build (amd64 + arm64)

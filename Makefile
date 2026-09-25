@@ -6,9 +6,6 @@ PYTEST  := $(VENV)/bin/pytest
 RUFF    := $(VENV)/bin/ruff
 MYPY    := $(VENV)/bin/mypy
 
-THRESHOLD ?= 0.65
-TOP_K     ?= 20
-
 # Ports come from .env so `make` and `docker compose` never disagree.
 # Override per-invocation: `make up CRIBRIX_API_PORT=9000`
 -include .env
@@ -62,15 +59,20 @@ scenarios-live: $(VENV) ## Run the 3 demo scenarios against real Jev + LLM APIs
 	$(PY) -m cribrix.evaluation.scenarios --live
 
 .PHONY: eval
-eval: $(VENV) ## Run the evaluation harness (baseline vs. cribrix)
-	$(PY) -m cribrix.evaluation.runner --threshold $(THRESHOLD) --top-k $(TOP_K)
+eval: $(VENV) ## Naive RAG vs Cribrix on the golden set, replaying recorded live calls
+	$(PY) -m cribrix.evaluation.runner --backend replay
+
+.PHONY: eval-fake
+eval-fake: $(VENV) ## Same harness on deterministic fakes (wiring check, not a quality claim)
+	$(PY) -m cribrix.evaluation.runner --backend fake
+
+.PHONY: eval-record
+eval-record: $(VENV) ## Re-record the golden set against the live Jev + LLM APIs (needs keys)
+	$(PY) -m cribrix.evaluation.runner --backend record --retry-errors
 
 .PHONY: eval-sweep
-eval-sweep: $(VENV) ## Sweep relevance thresholds to find the calibration point
-	@for t in 0.3 0.4 0.5 0.6 0.7 0.8 0.9; do \
-		echo "=== threshold $$t ==="; \
-		$(PY) -m cribrix.evaluation.runner --threshold $$t | head -11; \
-	done
+eval-sweep: $(VENV) ## Sweep triage thresholds over the recorded live signals (no API calls)
+	$(PY) -m cribrix.evaluation.runner --backend replay --sweep
 
 .PHONY: lint
 lint: $(VENV) ## Lint and type-check

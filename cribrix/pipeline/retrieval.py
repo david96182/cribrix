@@ -103,6 +103,31 @@ class PgVectorRetriever:
         return chunks
 
 
+class InMemoryVectorRetriever:
+    """Exact cosine search over an in-memory corpus.
+
+    Ranks exactly as ``PgVectorRetriever`` does with the same embedder (minus
+    HNSW's approximation), so the evaluation harness retrieves the same
+    candidates offline as the running stack does against Postgres.
+    """
+
+    def __init__(self, chunks: Sequence[Chunk], embedder: Embedder) -> None:
+        self._chunks = list(chunks)
+        self._embedder = embedder
+        self._vectors: list[list[float]] | None = None
+
+    async def retrieve(self, query: str, top_k: int) -> list[Chunk]:
+        if self._vectors is None:
+            self._vectors = [await self._embedder.embed(c.content) for c in self._chunks]
+        q = await self._embedder.embed(query)
+        scored = []
+        for chunk, vector in zip(self._chunks, self._vectors, strict=True):
+            similarity = sum(a * b for a, b in zip(q, vector, strict=True))
+            scored.append((1.0 - similarity, chunk.id, chunk))
+        scored.sort(key=lambda item: (item[0], item[1]))  # id breaks ties deterministically
+        return [c.model_copy(update={"distance": d}) for d, _, c in scored[:top_k]]
+
+
 class InMemoryRetriever:
     """Test double holding a fixed corpus, ranked by token overlap.
 
