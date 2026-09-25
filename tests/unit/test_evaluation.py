@@ -13,6 +13,7 @@ from cribrix.clients.llm import FakeLLMClient
 from cribrix.config import Settings
 from cribrix.evaluation.dataset import CORPUS, GOLDEN_CASES, GoldenCase, facts_present
 from cribrix.evaluation.runner import (
+    DEFAULT_RECORDING,
     Rate,
     cribrix_settings,
     evaluate,
@@ -191,3 +192,8 @@ async def test_sweep_rescoring_needs_no_api_calls() -> None:
     # A threshold above 1.0 keeps nothing: every unanswerable case "refuses".
     last = rows[-1]
     assert last[2] == 0 and last[4] == last[5]
+
+
+def test_committed_recording_exists() -> None:
+    """CI replays this file; it must ship with the repo."""
+    assert DEFAULT_RECORDING.exists()

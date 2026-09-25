@@ -84,6 +84,11 @@ jobs:
       - run: pip install -e ".[dev]"
       # Wiring check: the deterministic fakes. Says nothing about model quality.
       - run: python -m cribrix.evaluation.runner --backend fake
+      # Quality gate: replays the committed recording of live Jev + LLM calls,
+      # so the merge is gated on real model behaviour, offline and for free.
+      # A prompt or pipeline change that alters any request is a recording
+      # miss (exit 2) until `make eval-record` is re-run and committed.
+      - run: python -m cribrix.evaluation.runner --backend replay --min-accuracy 75 --max-hallucination 10
 
   docker:
     name: Docker build (amd64 + arm64)
