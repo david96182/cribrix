@@ -45,18 +45,30 @@ _SENTENCE_SPLIT_RE = re.compile(rf"{_ABBREVIATIONS}(?<=[.!?])\s+(?=[A-Z0-9])")
 
 _REFUSAL_RE = re.compile(
     r"\b(?:"
-    r"i (?:do not|don't) have (?:enough|sufficient) (?:information|context)"
+    r"i (?:do not|don't) (?:have|know)(?: (?:enough|sufficient|that|this|the))?"
+    r"(?: (?:information|context|detail))?"
     r"|(?:insufficient|not enough) (?:information|context)"
-    r"|(?:the )?(?:provided |given )?(?:context|passages?|sources?|documents?) "
-    r"(?:does not|doesn't|do not|don't) (?:contain|specify|state|mention|say|include|provide)"
-    r"|(?:is|are) not (?:specified|stated|mentioned|provided|given|included) "
-    r"in the (?:context|passages?|sources?|provided|available|given)"
+    r"|(?:there is |there's )?no information (?:is |was )?(?:available|provided|given|about|on)"
+    r"|(?:is|are) not (?:publicly )?(?:specified|stated|provided|available)\b"
+    r"|none of the (?:provided |given |available )?(?:context )?(?:passages?|sources?|documents?)"
+    r"(?: passages?)? (?:mention|contain|include|state|specify|cover|say|provide)"
+    r"|(?:the )?(?:provided |given |available )?"
+    r"(?:context|passages?|sources?|documents?|information)(?: passages?)? "
+    r"(?:does not|doesn't|do not|don't|contains? no) "
+    r"(?:contain|specify|state|mention|say|include|provide|cover)?"
+    r"|(?:is|are) not (?:specified|stated|mentioned|provided|given|included|publicly specified) "
+    r"(?:in the (?:context|passages?|sources?|provided|available|given))?"
     r"|(?:i|we) (?:cannot|can't|am unable to|are unable to|am not able to) "
     r"(?:answer|determine|find|say|tell)"
-    r"|no information (?:is |was )?(?:available|provided|given)"
+    r"|(?:the )?(?:provided |available )?information does not (?:specify|state|mention|include)"
     r")\b",
     re.IGNORECASE,
 )
+
+# Markdown emphasis, list markers and "Answer:" labels LLMs wrap text in.
+_MARKUP_RE = re.compile(r"[*_`#>]+|^\s*[-\u2022]\s+", re.MULTILINE)
+_LABEL_RE = re.compile(r"^\s*(?:answer|response)\s*:\s*", re.MULTILINE | re.IGNORECASE)
+_PARAGRAPH_RE = re.compile(r"\n\s*\n+")
 
 # Clause boundaries that commonly glue a claim onto a refusal.
 _CONTRAST_RE = re.compile(
@@ -98,10 +110,13 @@ class VerificationResult:
 
 def split_claims(answer: str) -> list[str]:
     """Split a draft into sentence-level claims. Nothing is discarded."""
-    cleaned = answer.strip()
+    cleaned = _LABEL_RE.sub("", _MARKUP_RE.sub("", answer)).strip()
     if not cleaned:
         return []
-    return [p.strip() for p in _SENTENCE_SPLIT_RE.split(cleaned) if p.strip()]
+    parts: list[str] = []
+    for paragraph in _PARAGRAPH_RE.split(cleaned):
+        parts.extend(p.strip() for p in _SENTENCE_SPLIT_RE.split(paragraph.strip()) if p.strip())
+    return parts
 
 
 def is_refusal(text: str) -> bool:

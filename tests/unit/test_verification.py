@@ -69,6 +69,26 @@ def test_normal_answer_is_not_a_refusal() -> None:
     assert not is_refusal("The refund window is 30 days.")
 
 
+@pytest.mark.parametrize(
+    "draft",
+    [
+        "**I don't know.**\n\nNone of the provided context passages mention the CEO.",
+        "**Answer:** The provided information does not specify it.\n\nNone of the "
+        "context passages mention sick leave.",
+        "The exact percentage is not publicly specified.",
+    ],
+)
+def test_markdown_wrapped_refusals_are_recognised(draft: str) -> None:
+    """Real LLM output: bold refusals, 'Answer:' labels, paragraph breaks."""
+    assert extract_claims(draft) == ([], True)
+
+
+def test_markdown_answer_is_split_into_claims() -> None:
+    claims, refused = extract_claims("**30 days**\n\nEnterprise customers get a refund.")
+    assert not refused
+    assert claims == ["30 days", "Enterprise customers get a refund."]
+
+
 def test_pure_refusal_yields_no_claims() -> None:
     claims, refused = extract_claims("The context does not specify the exact percentage.")
     assert (claims, refused) == ([], True)

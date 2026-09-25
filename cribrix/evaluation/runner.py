@@ -42,6 +42,7 @@ import argparse
 import asyncio
 import json
 import math
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -69,10 +70,14 @@ from cribrix.observability import configure_logging
 from cribrix.pipeline.orchestrator import RAGPipeline
 from cribrix.pipeline.retrieval import HashingEmbedder, InMemoryVectorRetriever, Retriever
 from cribrix.pipeline.triage import _decide
-from cribrix.pipeline.verification import extract_claims
+from cribrix.pipeline.verification import is_refusal, split_claims
 from cribrix.schemas import REFUSAL_STATUSES, AnswerStatus, QueryResponse
 
 DEFAULT_RECORDING = DEFAULT_RECORDINGS_DIR / "golden.json"
+
+# "There is no SLA guarantee for Pro customers." — a correct statement that the
+# thing asked about does not exist. Credited to the baseline as a refusal.
+_NEGATIVE_LEAD = re.compile(r"^(?:there is|there are|there's) no\b", re.IGNORECASE)
 NAIVE_TOP_K = 5
 
 
@@ -205,10 +210,13 @@ async def run_naive(
 ) -> tuple[AnswerStatus, str, list[int]]:
     """Top-k retrieval straight into a generic prompt, no gates.
 
-    To be fair to the baseline, a draft that is *purely* an admission that the
-    context lacks the answer is credited as DECLINED — the same rule Cribrix's
-    verifier applies. Modern models often refuse unprompted, and counting that
-    as a hallucination would flatter Cribrix.
+    To be fair to the baseline, a draft that *opens* with an admission that the
+    context lacks the answer is credited as DECLINED. That is deliberately more
+    generous than Cribrix's own verifier, which checks every sentence: models
+    typically explain a refusal ("I don't know. The passages only cover X and
+    Y."), and counting that explanation as a hallucination would flatter
+    Cribrix. Drafts that lead with an answer ("30 days. Enterprise customers
+    ...") are still counted as answers.
     """
     chunks = await retriever.retrieve(case.query, top_k=top_k)
     ids = [c.id for c in chunks]
@@ -216,8 +224,8 @@ async def run_naive(
         answer = await llm.generate(case.query, chunks, system_prompt=NAIVE_SYSTEM_PROMPT)
     except LLMError:
         return AnswerStatus.GENERATION_FAILED, "", ids
-    claims, refused = extract_claims(answer)
-    if refused and not claims:
+    sentences = split_claims(answer)
+    if sentences and (is_refusal(sentences[0]) or _NEGATIVE_LEAD.match(sentences[0])):
         return AnswerStatus.DECLINED, answer, ids
     return AnswerStatus.ANSWERED, answer, ids
 

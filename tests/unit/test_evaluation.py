@@ -111,6 +111,36 @@ def test_chitchat_scoring() -> None:
     assert score_case(CHITCHAT, AnswerStatus.ANSWERED, "policy")[0] is False
 
 
+# --- baseline refusal crediting ---------------------------------------------
+
+
+class _Says(FakeLLMClient):
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self._text = text
+
+    async def generate(self, query, chunks, *, system_prompt=None):  # type: ignore[no-untyped-def]
+        return self._text
+
+
+@pytest.mark.parametrize(
+    ("text", "status"),
+    [
+        ("**I don't know.**\n\nThe passages only cover laptops for marketing.", "DECLINED"),
+        ("There is no SLA guarantee for Pro plan customers.", "DECLINED"),
+        ("**30 days**\n\nEnterprise customers (which includes Business)...", "ANSWERED"),
+        ("**No**, the company does not offer a pension scheme.", "ANSWERED"),
+    ],
+)
+async def test_naive_baseline_is_credited_for_leading_refusals(text: str, status: str) -> None:
+    """The baseline gets the benefit of the doubt, but not for asserted answers."""
+    from cribrix.evaluation.runner import run_naive
+
+    retriever = InMemoryVectorRetriever(CORPUS, HashingEmbedder(dimension=384))
+    got, _, _ = await run_naive(_Says(text), retriever, UNANSWERABLE)
+    assert got.value == status
+
+
 # --- statistics ------------------------------------------------------------
 
 
