@@ -38,10 +38,15 @@ class Settings(BaseSettings):
 
     # --- Embeddings ---------------------------------------------------------
     embedding_dim: int = Field(
-        default=1536,
+        default=384,
         ge=8,
         le=16000,
-        description="Dimension of the vector column. Changing this requires a re-index.",
+        description=(
+            "Dimension of the vector column. Changing this requires a re-index. "
+            "384 suits the default HashingEmbedder and matches common small "
+            "sentence encoders (e.g. all-MiniLM-L6-v2); set 1536 for "
+            "text-embedding-3-small."
+        ),
     )
 
     # --- Retrieval ----------------------------------------------------------

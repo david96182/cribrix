@@ -28,6 +28,10 @@ def test_environment_defaults_to_production() -> None:
     assert Settings(env="local").is_dev is True
 
 
+def test_default_embedding_dim_suits_the_default_embedder() -> None:
+    assert Settings.model_fields["embedding_dim"].default == 384
+
+
 def test_sync_driver_is_rejected() -> None:
     """A sync DSN would block the event loop; fail at startup, not under load."""
     with pytest.raises(ValidationError, match="asyncpg"):
