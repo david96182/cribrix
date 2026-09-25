@@ -18,7 +18,7 @@ from cribrix.config import Settings, get_settings
 from cribrix.database import Database
 from cribrix.main import app, get_database, get_jev, get_llm, get_retriever
 from cribrix.pipeline.retrieval import InMemoryRetriever
-from cribrix.schemas import AnswerStatus, Chunk
+from cribrix.schemas import REFUSAL_STATUSES, AnswerStatus, Chunk
 
 
 class _FakeDatabase(Database):
@@ -72,10 +72,7 @@ async def test_refusal_is_a_200_not_an_error(client: AsyncClient) -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["verified"] is False
-    assert body["status"] in {
-        AnswerStatus.INSUFFICIENT_CONTEXT.value,
-        AnswerStatus.UNGROUNDED.value,
-    }
+    assert body["status"] in {s.value for s in REFUSAL_STATUSES}
 
 
 async def test_chitchat_is_handled(client: AsyncClient) -> None:

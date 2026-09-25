@@ -26,8 +26,12 @@ from cribrix.schemas import AnswerStatus
 
 @pytest.fixture
 def settings() -> Settings:
+    # 0.6 is tuned to the *fake's* token-coverage heuristic, where the
+    # same-vocabulary distractor lands exactly on 0.5. These tests check the
+    # wiring of each scenario, not the calibration of the real model.
     return Settings(
-        relevance_threshold=0.65,
+        relevance_threshold=0.6,
+        evidence_threshold=0.5,
         min_chunks_required=1,
         retrieval_top_k=10,
         max_chunks_to_llm=5,
@@ -116,9 +120,14 @@ async def test_mirage_reduces_prompt_size(settings: Settings) -> None:
 
 
 async def test_fabricated_percentage_is_blocked(settings: Settings) -> None:
-    """A generator that invents '10 percent' must not reach the user."""
+    """A generator that invents '10 percent' must not reach the user.
+
+    The evidence check is relaxed here (as the offline scenario does) so the
+    fabricated draft actually reaches the gate under test.
+    """
     liar = FakeLLMClient(hallucinate=True)
-    result, response = await run_cribrix(SCENARIO_HALLUCINATION, FakeJevClient(), liar, settings)
+    relaxed = settings.model_copy(update={"evidence_threshold": 0.0})
+    result, response = await run_cribrix(SCENARIO_HALLUCINATION, FakeJevClient(), liar, relaxed)
 
     assert liar.call_count == 1, "the draft was generated..."
     assert response.status is AnswerStatus.UNGROUNDED, "...and then withheld"
@@ -138,8 +147,9 @@ async def test_adversarial_probe_isolates_the_gate(settings: Settings) -> None:
     assert probe is not None
     blocked, verdicts = probe
     assert blocked is False, "the fabricated draft must not pass the gate"
-    fabricated = next(v for v in verdicts if "10%" in v[0])
-    assert fabricated[1] < settings.noul_threshold
+    fabricated = next(v for v in verdicts if "10%" in v.claim)
+    assert fabricated.grounded is False
+    assert fabricated.unsupported_numbers == ["10"]
 
 
 async def test_probe_returns_none_without_an_adversarial_draft(settings: Settings) -> None:

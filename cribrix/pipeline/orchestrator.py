@@ -45,23 +45,16 @@ CHITCHAT_REPLY = (
 
 def _sources_from(scored: list[ScoredChunk], kept: list[Chunk]) -> list[SourceRef]:
     """Build citations for the chunks that actually fed the answer."""
-    kept_ids = {c.id for c in kept}
-    by_id = {s.chunk.id: s for s in scored}
-    refs: list[SourceRef] = []
-    for chunk in kept:
-        if chunk.id not in kept_ids:
-            continue
-        relevance = by_id[chunk.id].relevance if chunk.id in by_id else 0.0
-        excerpt = chunk.content[:280] + ("..." if len(chunk.content) > 280 else "")
-        refs.append(
-            SourceRef(
-                chunk_id=chunk.id,
-                document_id=chunk.document_id,
-                relevance=round(relevance, 4),
-                excerpt=excerpt,
-            )
+    relevance = {s.chunk.id: s.relevance for s in scored}
+    return [
+        SourceRef(
+            chunk_id=chunk.id,
+            document_id=chunk.document_id,
+            relevance=round(relevance.get(chunk.id, 0.0), 4),
+            excerpt=chunk.content[:280] + ("..." if len(chunk.content) > 280 else ""),
         )
-    return refs
+        for chunk in kept
+    ]
 
 
 class RAGPipeline:
@@ -129,7 +122,10 @@ class RAGPipeline:
 
         # -- Stage 1: routing ----------------------------------------------
         with stage_timer(trace, "routing"):
-            intent, confidence = await route_intent(self._jev, query)
+            intent, confidence = await route_intent(
+                self._jev, query, chitchat_min_confidence=cfg.chitchat_min_confidence
+            )
+        trace.jev_requests += 1
         trace.intent = intent
         trace.intent_confidence = round(confidence, 4)
 
@@ -154,9 +150,12 @@ class RAGPipeline:
                 query,
                 candidates,
                 threshold=cfg.relevance_threshold,
+                evidence_threshold=cfg.evidence_threshold,
+                injection_max=cfg.injection_max,
                 max_keep=cfg.max_chunks_to_llm,
                 max_concurrency=cfg.jev_max_concurrency,
             )
+        trace.jev_requests += len(candidates)
         trace.scored_chunks = scored
         trace.kept_count = len(kept)
 
@@ -165,19 +164,22 @@ class RAGPipeline:
         # *before* spending a generation call.
         if len(kept) < cfg.min_chunks_required or not kept:
             trace.notes.append(
-                f"only {len(kept)} chunk(s) cleared threshold "
-                f"{cfg.relevance_threshold}; refusing without generating"
+                f"only {len(kept)} chunk(s) survived triage "
+                f"(relevance>={cfg.relevance_threshold}, evidence>={cfg.evidence_threshold}); "
+                "refusing without generating"
             )
             return finish(AnswerStatus.INSUFFICIENT_CONTEXT, REFUSAL_MESSAGE)
 
         # -- Stage 4: generation --------------------------------------------
         with stage_timer(trace, "generation"):
+            trace.llm_calls += 1
             try:
                 draft = await self._llm.generate(query, kept)
             except LLMError:
                 logger.error("generation.failed", exc_info=True)
                 trace.notes.append("generator error")
-                return finish(AnswerStatus.UNGROUNDED, REFUSAL_MESSAGE)
+                # An outage is not a verdict on the evidence; report it as such.
+                return finish(AnswerStatus.GENERATION_FAILED, REFUSAL_MESSAGE)
 
         # -- Stage 5: verification ------------------------------------------
         with stage_timer(trace, "verification"):
@@ -185,15 +187,22 @@ class RAGPipeline:
                 self._jev,
                 kept,
                 draft,
+                question=query,
                 mode=cfg.verification_mode,
                 groundedness_threshold=cfg.groundedness_threshold,
                 noul_threshold=cfg.noul_threshold,
                 fail_open=cfg.fail_open_on_verifier_error,
-                max_concurrency=cfg.jev_max_concurrency,
             )
+        if result.verdicts or result.reason == "verifier_unavailable":
+            trace.jev_requests += 1
         trace.claim_verdicts = result.verdicts
         trace.groundedness = result.groundedness
         trace.notes.append(f"verification: {result.reason}")
+
+        if result.declined:
+            # The generator read the relevant evidence and honestly said it does
+            # not contain the answer. That is a correct refusal, not an answer.
+            return finish(AnswerStatus.DECLINED, draft)
 
         if not result.passed:
             if result.reason == "verifier_unavailable":
@@ -201,9 +210,12 @@ class RAGPipeline:
             # The draft existed but wasn't supported — withhold it entirely.
             return finish(AnswerStatus.UNGROUNDED, REFUSAL_MESSAGE)
 
+        verified = result.reason != "verifier_unavailable_failed_open"
+        if not verified:
+            trace.notes.append("verifier unavailable; answer released unverified (fail-open)")
         return finish(
             AnswerStatus.ANSWERED,
             draft,
             sources=_sources_from(scored, kept),
-            verified=True,
+            verified=verified,
         )

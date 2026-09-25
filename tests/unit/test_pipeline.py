@@ -118,16 +118,69 @@ async def test_hallucinated_answer_is_blocked(settings: Settings, chunks: list[C
     assert liar.call_count == 1, "the draft was generated..."
     assert response.status is AnswerStatus.UNGROUNDED, "...and then withheld"
     assert response.answer == REFUSAL_MESSAGE
-    assert "Zanzibar" not in response.answer
+    assert "10 percent" not in response.answer
 
 
-async def test_generator_failure_degrades_to_refusal(
+async def test_generator_failure_is_reported_as_such(
     settings: Settings, chunks: list[Chunk]
 ) -> None:
+    """An outage is not a verdict about the evidence, so it gets its own status."""
     response = await _pipeline(settings, chunks, llm=FakeLLMClient(fail=True)).run(
         "What is the refund window for enterprise customers?"
     )
+    assert response.status is AnswerStatus.GENERATION_FAILED
+    assert response.answer == REFUSAL_MESSAGE
+    assert response.verified is False
+
+
+async def test_generator_that_declines_is_reported_as_declined(
+    settings: Settings, chunks: list[Chunk]
+) -> None:
+    """Relevant evidence, honest 'the context does not say' -> DECLINED, not ANSWERED."""
+
+    class _Honest(FakeLLMClient):
+        async def generate(self, query, chunks, *, system_prompt=None):  # type: ignore[no-untyped-def]
+            self.call_count += 1
+            return "The provided context does not specify that."
+
+    response = await _pipeline(settings, chunks, llm=_Honest()).run(
+        "What is the refund window for enterprise customers?"
+    )
+    assert response.status is AnswerStatus.DECLINED
+    assert response.verified is False
+    assert not response.sources
+
+
+async def test_refusal_wrapped_fabrication_is_blocked(
+    settings: Settings, chunks: list[Chunk]
+) -> None:
+    """End-to-end regression for the refusal-passthrough bypass."""
+
+    class _Sneaky(FakeLLMClient):
+        async def generate(self, query, chunks, *, system_prompt=None):  # type: ignore[no-untyped-def]
+            self.call_count += 1
+            return "The context does not say exactly, but it is 45 days."
+
+    response = await _pipeline(settings, chunks, llm=_Sneaky()).run(
+        "What is the refund window for enterprise customers?"
+    )
     assert response.status is AnswerStatus.UNGROUNDED
+    assert "45" not in response.answer
+
+
+async def test_fail_open_answers_are_not_marked_verified(
+    settings: Settings, chunks: list[Chunk]
+) -> None:
+    """Fail-open releases the answer, but must never claim it was verified."""
+    from tests.conftest import ScriptedJev
+
+    jev = ScriptedJev(fail={"verify"})
+    fail_open = settings.model_copy(update={"fail_open_on_verifier_error": True})
+    pipe = RAGPipeline(
+        jev=jev, llm=FakeLLMClient(), retriever=InMemoryRetriever(chunks), settings=fail_open
+    )
+    response = await pipe.run("What is the refund window for enterprise customers?")
+    assert response.status is AnswerStatus.ANSWERED
     assert response.verified is False
 
 
@@ -193,6 +246,16 @@ async def test_trace_records_every_stage(settings: Settings, chunks: list[Chunk]
     assert {"routing", "retrieval", "triage", "generation", "verification"} <= stages
     assert response.trace.total_ms > 0
     assert all(t.duration_ms >= 0 for t in response.trace.timings)
+
+
+async def test_trace_counts_model_calls(settings: Settings, chunks: list[Chunk]) -> None:
+    """1 route + 1 per retrieved chunk + 1 batched verification; 1 LLM call."""
+    response = await _pipeline(settings, chunks).run(
+        "What is the refund window for enterprise customers?"
+    )
+    assert response.trace is not None
+    assert response.trace.jev_requests == 1 + response.trace.retrieved_count + 1
+    assert response.trace.llm_calls == 1
 
 
 async def test_trace_can_be_suppressed(settings: Settings, chunks: list[Chunk]) -> None:

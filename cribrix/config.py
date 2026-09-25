@@ -62,16 +62,45 @@ class Settings(BaseSettings):
 
     # --- Triage (the cribrix) -------------------------------------------------
     relevance_threshold: float = Field(
-        default=0.65,
+        default=0.5,
         ge=0.0,
         le=1.0,
         description=(
-            "Chunks scoring below this are discarded. NOTE: Jev's Score primitive "
-            "is ordinal over a rubric, so normalised scores land on discrete steps "
-            "(with a 4-level rubric: 0, 0.33, 0.67, 1.0). A threshold must sit "
-            "between two steps to be meaningful; 0.7 would sit just above the "
-            "0.67 step and silently reject every partial match. 0.65 separates "
-            "'partially relevant' from 'same topic but misleading'."
+            "Chunks whose normalised relevance falls below this are discarded. "
+            "Jev's Score is the probability-weighted mean of the rubric levels "
+            "(0..3 for the 4-level rubric), divided by 3 here, so it is a "
+            "continuous 0..1 value: 0.33 = 'same topic, different entity', "
+            "0.67 = 'partially answers', 1.0 = 'directly answers'. Calibrate "
+            "with `make eval-sweep` against recorded live answers."
+        ),
+    )
+    evidence_threshold: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum Noul probability that a chunk *states* the requested "
+            "information. Separates answerability from topical relevance. "
+            "0.0 disables the check."
+        ),
+    )
+    injection_max: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Chunks whose prompt-injection Noul exceeds this never reach the "
+            "generator. A filter, not a security boundary."
+        ),
+    )
+    chitchat_min_confidence: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Choice confidence required to skip retrieval as CHITCHAT. Anything "
+            "less certain is searched: a wasted search is cheaper than an "
+            "unanswered question."
         ),
     )
     min_chunks_required: int = Field(
@@ -94,9 +123,9 @@ class Settings(BaseSettings):
     verification_mode: Literal["atomic", "holistic"] = Field(
         default="atomic",
         description=(
-            "'atomic' decomposes the draft into sentence-level claims and verifies "
-            "each independently; 'holistic' runs one boolean over the whole draft. "
-            "Holistic is cheaper but fails spuriously on multi-claim answers."
+            "'atomic' asks one Noul per sentence-level claim (all in a single "
+            "request); 'holistic' asks one Noul about the whole draft. Both cost "
+            "one request; atomic reports which claim failed."
         ),
     )
     groundedness_threshold: float = Field(
@@ -132,16 +161,15 @@ class Settings(BaseSettings):
         default=8,
         ge=1,
         le=256,
-        description="Semaphore bound on Jev fan-out during triage and verification.",
+        description="Semaphore bound on concurrent Jev requests during triage.",
     )
     noul_threshold: float = Field(
         default=0.5,
         ge=0.0,
         le=1.0,
         description=(
-            "Noul returns a probability, not a boolean. A claim counts as grounded "
-            "at or above this value. Live calls return ~0.02 for fabrications and "
-            "~0.98 for supported claims, so 0.5 sits in a very wide valley."
+            "Noul returns the probability that a claim is supported. A claim "
+            "counts as grounded at or above this value."
         ),
     )
 

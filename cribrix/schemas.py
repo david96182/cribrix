@@ -44,11 +44,33 @@ class AnswerStatus(StrEnum):
     INSUFFICIENT_CONTEXT = "INSUFFICIENT_CONTEXT"
     """Chunks retrieved, but none cleared the relevance threshold."""
 
+    DECLINED = "DECLINED"
+    """Relevant chunks reached the generator, and it honestly said they do not
+    contain the answer. A correct refusal, reported as such rather than as an
+    answer."""
+
     UNGROUNDED = "UNGROUNDED"
     """A draft was produced but failed fact-checking; withheld from the user."""
 
+    GENERATION_FAILED = "GENERATION_FAILED"
+    """The System-2 generator errored or timed out. An infrastructure failure,
+    not a verdict about the evidence."""
+
     VERIFIER_UNAVAILABLE = "VERIFIER_UNAVAILABLE"
     """Verifier errored and policy is fail-closed."""
+
+
+REFUSAL_STATUSES = frozenset(
+    {
+        AnswerStatus.NO_DOCUMENTS,
+        AnswerStatus.INSUFFICIENT_CONTEXT,
+        AnswerStatus.DECLINED,
+        AnswerStatus.UNGROUNDED,
+        AnswerStatus.GENERATION_FAILED,
+        AnswerStatus.VERIFIER_UNAVAILABLE,
+    }
+)
+"""Every terminal state in which the user does not receive a substantive answer."""
 
 
 REFUSAL_MESSAGE = "Could not generate a reliable response with the current information."
@@ -86,8 +108,29 @@ class ScoredChunk(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     chunk: Chunk
-    relevance: float = Field(ge=0.0, le=1.0, description="Jev semantic relevance score.")
-    kept: bool = Field(description="Whether this chunk cleared the relevance threshold.")
+    relevance: float = Field(
+        ge=0.0, le=1.0, description="Normalised Jev Score: 0 = unrelated, 1 = direct answer."
+    )
+    answers: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Jev Noul: probability the passage states what the question asks.",
+    )
+    injection: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Jev Noul: probability the passage tries to instruct the model.",
+    )
+    kept: bool = Field(description="Whether this chunk was forwarded to the generator.")
+    drop_reason: str | None = Field(
+        default=None,
+        description=(
+            "Why the chunk was dropped: prompt_injection, irrelevant, does_not_answer, "
+            "over_budget or assessment_failed. None when kept."
+        ),
+    )
 
 
 class ClaimVerdict(BaseModel):
@@ -104,6 +147,13 @@ class ClaimVerdict(BaseModel):
         description=(
             "Raw Noul probability behind the verdict. Retained so the trace can "
             "show how confident a rejection was, not merely that one occurred."
+        ),
+    )
+    unsupported_numbers: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Numbers in the claim that do not appear in the evidence. Checked in "
+            "code, not by the model; any entry makes the claim ungrounded."
         ),
     )
 
@@ -140,6 +190,8 @@ class PipelineTrace(BaseModel):
         default=None,
         description="Fraction of atomic claims found grounded. None if not verified.",
     )
+    jev_requests: int = Field(default=0, description="System-1 API requests made.")
+    llm_calls: int = Field(default=0, description="System-2 generation calls made.")
     timings: list[StageTiming] = Field(default_factory=list)
     total_ms: float = 0.0
     notes: list[str] = Field(default_factory=list)

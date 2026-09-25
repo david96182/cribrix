@@ -4,40 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from cribrix.clients.jev import ROUTING_CRITERIA, FakeJevClient, JevError
+from cribrix.clients.jev import ROUTING_CRITERIA, FakeJevClient, RouteDecision
 from cribrix.pipeline.router import route_intent
 from cribrix.schemas import Intent
+from tests.conftest import ScriptedJev
 
 
-class _StubJev:
-    """Jev stub returning a canned label, or raising."""
-
-    def __init__(self, label: str | None = None, *, raises: bool = False) -> None:
-        self._label = label
-        self._raises = raises
-        self.seen_options: dict[str, str] | None = None
-
-    async def choice(self, context: object, options: dict[str, str]) -> tuple[str, float]:
-        self.seen_options = options
-        if self._raises:
-            raise JevError("boom")
-        assert self._label is not None
-        return self._label, 0.9
-
-    async def score(self, question: str, document: str) -> float:  # pragma: no cover
-        return 0.0
-
-    async def score_batch(self, question: str, documents: list[str]) -> list[float]:
-        return [0.0] * len(documents)  # pragma: no cover
-
-    async def grounded(self, source: str, claim: str) -> float:  # pragma: no cover
-        return 1.0
-
-    async def health(self) -> bool:  # pragma: no cover
-        return not self._raises
-
-    async def aclose(self) -> None:  # pragma: no cover
-        return None
+def _stub(label: str, confidence: float = 0.95) -> ScriptedJev:
+    return ScriptedJev(route=RouteDecision(label, confidence, {}))
 
 
 @pytest.mark.parametrize(
@@ -46,6 +20,7 @@ class _StubJev:
         "What is the refund policy for enterprise contracts?",
         "Explain how the encryption key rotation works",
         "Which document describes the SLA uptime guarantee?",
+        "office wifi password",
     ],
 )
 async def test_substantive_questions_route_to_search(jev: FakeJevClient, query: str) -> None:
@@ -58,38 +33,47 @@ async def test_greetings_route_to_chitchat(jev: FakeJevClient, query: str) -> No
 
 
 async def test_router_passes_exactly_the_two_expected_options() -> None:
-    """The option set is part of the contract with the classifier."""
-    stub = _StubJev("SEARCH")
+    stub = _stub("SEARCH")
     await route_intent(stub, "anything")
-    assert stub.seen_options == ROUTING_CRITERIA
-    assert set(stub.seen_options) == {"SEARCH", "CHITCHAT"}
-    # Criteria carry descriptions, not bare labels: the model is told what
-    # each option *means*, which is what makes the live router accurate.
-    assert all(isinstance(v, str) and v for v in stub.seen_options.values())
+    _, options = stub.route_calls[0]
+    assert options == ROUTING_CRITERIA
+    assert set(options) == {"SEARCH", "CHITCHAT"}
+    # Criteria carry descriptions, not bare labels.
+    assert all(isinstance(v, str) and v for v in options.values())
+
+
+async def test_confident_chitchat_skips_retrieval() -> None:
+    assert await route_intent(_stub("CHITCHAT", 0.95), "hi") == (Intent.CHITCHAT, 0.95)
+
+
+async def test_uncertain_chitchat_is_searched_instead() -> None:
+    """Confidence-gated routing: CHITCHAT is only taken when the model is sure."""
+    intent, confidence = await route_intent(
+        _stub("CHITCHAT", 0.55), "thanks, what about refunds", chitchat_min_confidence=0.8
+    )
+    assert intent is Intent.SEARCH
+    assert confidence == 0.55
+
+
+async def test_low_confidence_search_is_still_search() -> None:
+    """The gate only guards the cheap exit; SEARCH needs no confidence."""
+    assert (await route_intent(_stub("SEARCH", 0.1), "q"))[0] is Intent.SEARCH
 
 
 async def test_router_normalises_case_and_whitespace() -> None:
-    """A well-behaved client shouldn't return this, but tolerate it anyway."""
-    assert (await route_intent(_StubJev("  search  "), "q"))[0] is Intent.SEARCH
+    assert (await route_intent(_stub("  search  "), "q"))[0] is Intent.SEARCH
 
 
 async def test_router_defaults_to_search_on_unknown_label() -> None:
-    """An unrecognised label must not be allowed to skip retrieval."""
-    assert (await route_intent(_StubJev("MAYBE_SEARCH"), "q"))[0] is Intent.SEARCH
+    assert (await route_intent(_stub("MAYBE_SEARCH"), "q"))[0] is Intent.SEARCH
 
 
 async def test_router_defaults_to_search_on_client_error() -> None:
-    """Fail towards retrieval.
-
-    Misrouting CHITCHAT->SEARCH wastes a little compute. Misrouting
-    SEARCH->CHITCHAT silently answers a real question with no grounding and no
-    fact-check. The costs are asymmetric, so the default is.
-    """
-    assert (await route_intent(_StubJev(raises=True), "q?"))[0] is Intent.SEARCH
+    """Fail towards retrieval: the costs of misrouting are asymmetric."""
+    assert await route_intent(ScriptedJev(fail={"route"}), "q?") == (Intent.SEARCH, 0.0)
 
 
 async def test_router_is_deterministic(jev: FakeJevClient) -> None:
-    """Same input, same decision — required for reproducible evaluation."""
     query = "What is the refund window?"
     first, _ = await route_intent(jev, query)
     for _ in range(5):

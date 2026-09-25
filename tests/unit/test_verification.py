@@ -2,80 +2,54 @@
 
 from __future__ import annotations
 
-from cribrix.clients.jev import JevError
+import pytest
+
 from cribrix.pipeline.verification import (
+    extract_claims,
     is_refusal,
+    numbers_in,
     split_claims,
+    unsupported_numbers,
     verify_answer,
 )
 from cribrix.schemas import Chunk
-
-
-class _ScriptedJev:
-    """Jev stub returning preset booleans, keyed by claim substring."""
-
-    def __init__(
-        self,
-        verdicts: dict[str, bool] | None = None,
-        *,
-        default: bool = True,
-        raises: bool = False,
-    ) -> None:
-        self._verdicts = verdicts or {}
-        self._default = default
-        self._raises = raises
-        self.claims_seen: list[str] = []
-
-    async def choice(  # pragma: no cover
-        self, context: object, options: dict[str, str]
-    ) -> tuple[str, float]:
-        return next(iter(options)), 1.0
-
-    async def score(self, question: str, document: str) -> float:  # pragma: no cover
-        return 1.0
-
-    async def score_batch(  # pragma: no cover
-        self, question: str, documents: list[str]
-    ) -> list[float]:
-        return [1.0] * len(documents)
-
-    async def grounded(self, source: str, claim: str) -> float:
-        """Return a probability, mirroring the real Noul primitive."""
-        if self._raises:
-            raise JevError("verifier down")
-        self.claims_seen.append(claim)
-        for needle, verdict in self._verdicts.items():
-            if needle in claim:
-                return 0.98 if verdict else 0.02
-        return 0.98 if self._default else 0.02
-
-    async def health(self) -> bool:  # pragma: no cover
-        return not self._raises
-
-    async def aclose(self) -> None:  # pragma: no cover
-        return None
-
+from tests.conftest import ScriptedJev
 
 CTX = [Chunk(id=1, document_id="d", content="The refund window is 30 days for enterprise.")]
+BONUS = [
+    Chunk(
+        id=1,
+        document_id="comp",
+        content="The bonus percentage is decided by the board every December.",
+    )
+]
+
+
+def _jev(bad: tuple[str, ...] = (), *, default: float = 0.98, **kw: object) -> ScriptedJev:
+    """Claims containing any `bad` substring score 0.02; everything else `default`."""
+
+    def verify(claim: str) -> float:
+        return 0.02 if any(b in claim for b in bad) else default
+
+    return ScriptedJev(verify=verify, **kw)  # type: ignore[arg-type]
 
 
 # --- claim splitting -------------------------------------------------------
 
 
 def test_split_claims_separates_sentences() -> None:
-    claims = split_claims("The window is 30 days. Refunds take 10 business days.")
-    assert len(claims) == 2
+    assert len(split_claims("The window is 30 days. Refunds take 10 business days.")) == 2
 
 
 def test_split_claims_does_not_break_on_decimals() -> None:
     """'47.3%' must not be shattered into two claims."""
-    claims = split_claims("Revenue grew by 47.3 percent this year in the region.")
-    assert len(claims) == 1
+    assert len(split_claims("Revenue grew by 47.3 percent this year in the region.")) == 1
 
 
-def test_split_claims_drops_trivial_fragments() -> None:
-    """'Yes.' asserts nothing verifiable and would only add noise."""
-    assert split_claims("Yes.") == []
+def test_split_claims_keeps_short_fragments() -> None:
+    """Short fragments are where a bare fabricated figure hides. Never drop them."""
+    assert split_claims("It is 10%.") == ["It is 10%."]
+    assert split_claims("Yes.") == ["Yes."]
 
 
 def test_split_claims_on_empty_input() -> None:
@@ -88,134 +62,177 @@ def test_split_claims_on_empty_input() -> None:
 def test_recognises_refusal_phrasings() -> None:
     assert is_refusal("I don't have enough information to answer that.")
     assert is_refusal("The provided context does not mention revenue.")
+    assert is_refusal("The exact percentage is not specified in the context.")
 
 
 def test_normal_answer_is_not_a_refusal() -> None:
     assert not is_refusal("The refund window is 30 days.")
 
 
+def test_pure_refusal_yields_no_claims() -> None:
+    claims, refused = extract_claims("The context does not specify the exact percentage.")
+    assert (claims, refused) == ([], True)
+
+
+@pytest.mark.parametrize(
+    "draft",
+    [
+        "The context does not state it, but the bonus is 10%.",
+        "The context doesn't specify the percentage; however, it is typically 10%.",
+        "I don't have enough information. The bonus is 10%.",
+    ],
+)
+def test_claims_hidden_behind_refusal_language_are_extracted(draft: str) -> None:
+    """Regression: refusal wording anywhere used to wave the whole draft through."""
+    claims, refused = extract_claims(draft)
+    assert refused
+    assert any("10%" in c for c in claims)
+
+
+# --- deterministic numeric check -------------------------------------------
+
+
+def test_number_normalisation() -> None:
+    assert numbers_in("1,000 requests") == numbers_in("1000 requests") == {"1000"}
+    assert "5" in numbers_in("retried up to five times")
+    assert "99.95" in numbers_in("99.95 percent")
+
+
+def test_unsupported_numbers_are_detected() -> None:
+    evidence = "The rate limit is 1000 requests per minute."
+    assert unsupported_numbers("The rate limit is 10000 requests per minute.", evidence) == [
+        "10000"
+    ]
+    assert unsupported_numbers("The limit is 1,000 per minute.", evidence) == []
+
+
+def test_prose_number_words_in_a_claim_are_not_flagged() -> None:
+    """'one of', 'first' are prose. Flagging them would make the gate over-refuse."""
+    assert unsupported_numbers("One of the options is the first plan.", "Plans exist.") == []
+
+
+def test_spelled_out_evidence_supports_digit_claims() -> None:
+    assert unsupported_numbers("Deliveries are retried 5 times.", "retried up to five times") == []
+
+
 # --- the gate --------------------------------------------------------------
 
 
 async def test_fully_grounded_answer_passes() -> None:
-    result = await verify_answer(
-        _ScriptedJev(default=True), CTX, "The refund window is 30 days for enterprise."
-    )
+    result = await verify_answer(_jev(), CTX, "The refund window is 30 days for enterprise.")
     assert result.passed is True
     assert result.groundedness == 1.0
 
 
 async def test_fully_ungrounded_answer_is_blocked() -> None:
-    result = await verify_answer(
-        _ScriptedJev(default=False), CTX, "Revenue in 2019 was 4.2 billion dollars."
-    )
+    result = await verify_answer(_jev(default=0.02), CTX, "Revenue in 2019 was huge.")
     assert result.passed is False
     assert result.groundedness == 0.0
 
 
 async def test_partially_grounded_answer_is_blocked_at_strict_threshold() -> None:
-    """Three true claims plus one fabrication must still fail at threshold 1.0.
-
-    This is the scenario a single holistic boolean handles poorly and the
-    reason atomic verification is the default.
-    """
     answer = (
         "The refund window is 30 days. Requests go through the billing portal. "
-        "Processing takes 10 business days. Revenue rose 47 percent in Zanzibar."
+        "Enterprise customers qualify. Revenue rose sharply in Zanzibar."
     )
-    jev = _ScriptedJev({"Zanzibar": False}, default=True)
-
-    result = await verify_answer(jev, CTX, answer, groundedness_threshold=1.0)
-
+    result = await verify_answer(_jev(("Zanzibar",)), CTX, answer, groundedness_threshold=1.0)
     assert result.passed is False
     assert result.groundedness == 0.75
     assert sum(1 for v in result.verdicts if not v.grounded) == 1
 
 
 async def test_partially_grounded_answer_passes_at_relaxed_threshold() -> None:
-    """The threshold is a real dial, not decoration."""
     answer = (
         "The refund window is 30 days. Requests go through the billing portal. "
-        "Processing takes 10 business days. Revenue rose 47 percent in Zanzibar."
+        "Enterprise customers qualify. Revenue rose sharply in Zanzibar."
     )
-    jev = _ScriptedJev({"Zanzibar": False}, default=True)
-
-    result = await verify_answer(jev, CTX, answer, groundedness_threshold=0.7)
-
+    result = await verify_answer(_jev(("Zanzibar",)), CTX, answer, groundedness_threshold=0.7)
     assert result.passed is True
-    assert result.groundedness == 0.75
 
 
-async def test_every_claim_is_checked_individually() -> None:
-    jev = _ScriptedJev(default=True)
-    answer = "First claim is here. Second claim is here. Third claim is here."
+async def test_all_claims_are_verified_in_a_single_request() -> None:
+    """Jev evaluates many questions in one call; verification must use that."""
+    jev = _jev()
+    await verify_answer(jev, CTX, "First claim is here. Second claim is here. Third claim here.")
+    assert len(jev.verify_calls) == 1
+    assert len(jev.verify_calls[0]) == 3
 
-    await verify_answer(jev, CTX, answer)
 
-    assert len(jev.claims_seen) == 3
+async def test_holistic_mode_sends_one_combined_claim() -> None:
+    jev = _jev()
+    result = await verify_answer(jev, CTX, "First claim here. Second claim here.", mode="holistic")
+    assert jev.verify_calls == [["First claim here. Second claim here."]]
+    assert result.passed is True
 
 
-async def test_refusal_bypasses_the_gate() -> None:
-    """An honest refusal is not entailed by the context, but it is correct.
+async def test_fabricated_number_fails_even_if_the_model_says_supported() -> None:
+    """Numbers are checked in code: Jev is documented as weak at numeric comparison."""
+    result = await verify_answer(_jev(default=0.99), BONUS, "The bonus is 10% every December.")
+    assert result.passed is False
+    assert result.verdicts[0].unsupported_numbers == ["10"]
+    assert result.verdicts[0].probability == 0.99
 
-    Without this passthrough the system would replace a correct "I don't know"
-    with a generic error — strictly worse for the user.
-    """
-    jev = _ScriptedJev(default=False)
 
+async def test_refusal_wrapper_does_not_bypass_the_gate() -> None:
+    """Regression for the 'the context does not state it, but it is 10%' bypass."""
+    result = await verify_answer(
+        _jev(default=0.99), BONUS, "The context does not state it, but the bonus is 10%."
+    )
+    assert result.passed is False
+    assert result.declined is False
+
+
+async def test_short_fabrication_is_verified_not_skipped() -> None:
+    """Regression for the 'It is 10%.' bypass via the minimum-length filter."""
+    jev = _jev(default=0.99)
+    result = await verify_answer(
+        jev, BONUS, "It is 10%.", question="What is the exact bonus percentage?"
+    )
+    assert result.passed is False
+    # The fragment is sent with the question attached so the model can judge it.
+    assert "exact bonus percentage" in jev.verify_calls[0][0]
+
+
+async def test_pure_refusal_is_reported_as_declined() -> None:
+    """An honest refusal is not a fabrication, and is flagged as a decline."""
+    jev = _jev(default=0.02)
     result = await verify_answer(jev, CTX, "I don't have enough information to answer that.")
-
     assert result.passed is True
-    assert result.reason == "refusal_passthrough"
-    assert jev.claims_seen == []
+    assert result.declined is True
+    assert jev.verify_calls == []
+
+
+async def test_empty_draft_fails() -> None:
+    result = await verify_answer(_jev(), CTX, "   ")
+    assert result.passed is False
+    assert result.reason == "empty_draft"
 
 
 async def test_empty_context_always_fails_regardless_of_fail_open() -> None:
-    """Nothing can be grounded in nothing; never fail open here."""
-    result = await verify_answer(
-        _ScriptedJev(default=True), [], "Some confident claim about things.", fail_open=True
-    )
+    result = await verify_answer(_jev(), [], "Some confident claim about things.", fail_open=True)
     assert result.passed is False
     assert result.reason == "no_context_to_verify_against"
 
 
 async def test_verifier_outage_fails_closed_by_default() -> None:
-    result = await verify_answer(
-        _ScriptedJev(raises=True), CTX, "A claim.", mode="holistic", fail_open=False
-    )
+    result = await verify_answer(_jev(fail={"verify"}), CTX, "A claim about refunds.")
     assert result.passed is False
     assert result.reason == "verifier_unavailable"
 
 
 async def test_verifier_outage_can_fail_open_when_configured() -> None:
-    """Availability-over-safety is a legitimate product choice — made explicit."""
-    result = await verify_answer(
-        _ScriptedJev(raises=True), CTX, "A claim.", mode="holistic", fail_open=True
-    )
+    result = await verify_answer(_jev(fail={"verify"}), CTX, "A claim.", fail_open=True)
     assert result.passed is True
     assert result.reason == "verifier_unavailable_failed_open"
 
 
-async def test_per_claim_failure_is_treated_as_ungrounded() -> None:
-    """In atomic mode a failed check must never be optimistically passed."""
-    result = await verify_answer(
-        _ScriptedJev(raises=True), CTX, "A sufficiently long claim here.", mode="atomic"
-    )
+async def test_malformed_verifier_response_fails_closed() -> None:
+    class _Short(ScriptedJev):
+        async def verify_claims(self, source, claims):  # type: ignore[no-untyped-def]
+            from cribrix.clients.jev import GroundingResult
+
+            return GroundingResult([0.99])  # one probability for two claims
+
+    result = await verify_answer(_Short(), CTX, "First claim here. Second claim here.")
     assert result.passed is False
-    assert result.groundedness == 0.0
-
-
-async def test_holistic_mode_makes_exactly_one_call() -> None:
-    jev = _ScriptedJev(default=True)
-    answer = "First claim is here. Second claim is here. Third claim is here."
-
-    result = await verify_answer(jev, CTX, answer, mode="holistic")
-
-    assert len(jev.claims_seen) == 1
-    assert result.passed is True
-
-
-async def test_answer_with_no_verifiable_claims_passes() -> None:
-    result = await verify_answer(_ScriptedJev(default=False), CTX, "Yes.")
-    assert result.passed is True
-    assert result.reason == "no_verifiable_claims"
+    assert result.reason == "verifier_unavailable"

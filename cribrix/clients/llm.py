@@ -28,6 +28,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
+from cribrix.clients.recording import RecordingMiss, ResponseCache, request_key
 from cribrix.config import Settings
 from cribrix.schemas import Chunk
 
@@ -115,6 +116,7 @@ class OpenAICompatibleClient:
         extra_headers: dict[str, str] | None = None,
     ) -> None:
         self._model = model
+        self.model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
         headers = {
@@ -219,6 +221,7 @@ class AnthropicClient:
         max_tokens: int = 500,
     ) -> None:
         self._model = model
+        self.model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._client = httpx.AsyncClient(
@@ -296,6 +299,8 @@ class FakeLLMClient:
     number, which is how the gate's positive case is tested.
     """
 
+    model = "fake-extractive"
+
     def __init__(
         self, *, latency_s: float = 0.0, fail: bool = False, hallucinate: bool = False
     ) -> None:
@@ -340,7 +345,81 @@ class FakeLLMClient:
         return None
 
 
-def build_llm_client(settings: Settings) -> LLMClient:
+class RecordingLLMClient:
+    """Record live generations to disk, or replay them without a network.
+
+    The key covers the model, system prompt, question and the exact evidence
+    passed in, so a change in what triage keeps produces a miss rather than a
+    stale draft. Generation failures are recorded too: replaying a run must
+    reproduce its GENERATION_FAILED outcomes, not quietly retry them.
+    """
+
+    def __init__(
+        self, cache: ResponseCache, inner: LLMClient | None = None, *, retry_errors: bool = False
+    ) -> None:
+        if cache.mode == "record" and inner is None:
+            raise ValueError("record mode needs a live client to record from")
+        self._cache = cache
+        self._inner = inner
+        self._retry_errors = retry_errors
+        self.model = getattr(inner, "model", None) or cache.meta.get("llm_model", "unknown")
+        if cache.mode == "record":
+            cache.update_meta(llm_model=self.model)
+
+    async def generate(
+        self, query: str, chunks: list[Chunk], *, system_prompt: str | None = None
+    ) -> str:
+        key = request_key(
+            {
+                "kind": "llm",
+                "model": self.model,
+                "system": system_prompt or SYSTEM_PROMPT,
+                "query": query,
+                "chunks": [c.content for c in chunks],
+            }
+        )
+        hit = self._cache.get(key)
+        if hit is not None and "error" in hit and self._retry_errors and self._inner is not None:
+            hit = None  # re-attempt transient upstream failures when re-recording
+        if hit is None:
+            if self._cache.mode == "replay":
+                raise RecordingMiss(
+                    "LLM generation was not recorded. Re-record with `make eval-record`."
+                )
+            assert self._inner is not None
+            try:
+                text = await self._inner.generate(query, chunks, system_prompt=system_prompt)
+            except LLMError as exc:
+                self._cache.put(key, {"error": str(exc)[:300]})
+                raise
+            self._cache.put(key, {"text": text})
+            return text
+        if "error" in hit:
+            raise LLMError(f"(replayed) {hit['error']}")
+        return str(hit["text"])
+
+    async def health(self) -> bool:
+        return True if self._inner is None else await self._inner.health()
+
+    async def aclose(self) -> None:
+        self._cache.flush()
+        if self._inner is not None:
+            await self._inner.aclose()
+
+
+def build_llm_client(
+    settings: Settings, *, cache: ResponseCache | None = None, retry_errors: bool = False
+) -> LLMClient:
+    """Construct the generator, optionally wrapped for record/replay."""
+    if cache is not None and cache.mode == "replay":
+        return RecordingLLMClient(cache)
+    client = _build_llm_client(settings)
+    if cache is None:
+        return client
+    return RecordingLLMClient(cache, client, retry_errors=retry_errors)
+
+
+def _build_llm_client(settings: Settings) -> LLMClient:
     """Construct the generator described by configuration.
 
     Raises:

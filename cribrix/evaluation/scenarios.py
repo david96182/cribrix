@@ -31,7 +31,7 @@ from cribrix.config import Settings, get_settings
 from cribrix.observability import configure_logging
 from cribrix.pipeline.orchestrator import RAGPipeline
 from cribrix.pipeline.retrieval import InMemoryRetriever
-from cribrix.schemas import AnswerStatus, Chunk, QueryResponse
+from cribrix.schemas import AnswerStatus, Chunk, ClaimVerdict, QueryResponse
 
 # Rough public pricing midpoint, only used to make token savings legible.
 USD_PER_1K_INPUT_TOKENS = 0.0005
@@ -176,7 +176,11 @@ SCENARIO_HALLUCINATION = Scenario(
         "'10%' — with full confidence and a real citation attached."
     ),
     expected=AnswerStatus.UNGROUNDED,
-    notes=["Measures: fabricated figure detected and withheld."],
+    notes=[
+        "Measures: fabricated figure detected and withheld.",
+        "Offline, triage's answer-evidence check is relaxed (evidence_threshold=0) so "
+        "the fabricated draft actually reaches the gate being demonstrated.",
+    ],
     force_hallucination=True,
     adversarial_draft=(
         "The company offers an annual performance bonus of 10%. "
@@ -258,11 +262,7 @@ async def run_cribrix(
 
     trace = response.trace
     kept = [s.chunk for s in (trace.scored_chunks if trace else []) if s.kept]
-    llm_called = response.status not in {
-        AnswerStatus.CHITCHAT,
-        AnswerStatus.NO_DOCUMENTS,
-        AnswerStatus.INSUFFICIENT_CONTEXT,
-    }
+    llm_called = bool(trace and trace.llm_calls)
     prompt_chars = len(build_prompt(scenario.query, kept)) if llm_called else 0
 
     detail = ""
@@ -288,7 +288,7 @@ async def run_cribrix(
 
 async def probe_verifier(
     scenario: Scenario, jev: JevClient, settings: Settings
-) -> tuple[bool, list[tuple[str, float]]] | None:
+) -> tuple[bool, list[ClaimVerdict]] | None:
     """Feed a known fabrication straight to the groundedness gate.
 
     Bypasses the generator entirely. Whether a given LLM hallucinates is a
@@ -303,12 +303,12 @@ async def probe_verifier(
         jev,
         scenario.corpus,
         scenario.adversarial_draft,
+        question=scenario.query,
         mode=settings.verification_mode,
         groundedness_threshold=settings.groundedness_threshold,
         noul_threshold=settings.noul_threshold,
-        max_concurrency=settings.jev_max_concurrency,
     )
-    return result.passed, [(v.claim, v.probability) for v in result.verdicts]
+    return result.passed, list(result.verdicts)
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +326,7 @@ def print_scenario(
     naive: RunResult,
     guarded: RunResult,
     response: QueryResponse,
-    probe: tuple[bool, list[tuple[str, float]]] | None = None,
+    probe: tuple[bool, list[ClaimVerdict]] | None = None,
 ) -> None:
     """Render a single scenario comparison."""
     bar = "=" * 78
@@ -358,20 +358,33 @@ def print_scenario(
         print("\n   triage detail:")
         for scored in trace.scored_chunks:
             mark = "KEEP" if scored.kept else "DROP"
-            print(f"     [{mark}] rel={scored.relevance:.2f}  {scored.chunk.content[:58]}")
+            why = "" if scored.kept else f"  ({scored.drop_reason})"
+            print(
+                f"     [{mark}] rel={scored.relevance:.2f} ans={scored.answers:.2f}  "
+                f"{scored.chunk.content[:48]}{why}"
+            )
     if trace and trace.claim_verdicts:
         print("\n   fact-check detail:")
         for verdict in trace.claim_verdicts:
             mark = "OK " if verdict.grounded else "BAD"
-            print(f"     [{mark}] p={verdict.probability:.2f}  {verdict.claim[:58]}")
+            extra = f"  numbers not in source: {verdict.unsupported_numbers}"
+            print(
+                f"     [{mark}] p={verdict.probability:.2f}  {verdict.claim[:58]}"
+                + (extra if verdict.unsupported_numbers else "")
+            )
 
     if probe is not None:
         blocked, probe_claims = probe
         print("\n   adversarial verifier probe (bypasses the generator):")
         print(f"     draft: {scenario.adversarial_draft!r}")
-        for claim, prob in probe_claims:
-            mark = "OK " if prob >= 0.5 else "BAD"
-            print(f"     [{mark}] p={prob:.2f}  {claim[:56]}")
+        for verdict in probe_claims:
+            mark = "OK " if verdict.grounded else "BAD"
+            extra = (
+                f"  numbers not in source: {verdict.unsupported_numbers}"
+                if verdict.unsupported_numbers
+                else ""
+            )
+            print(f"     [{mark}] p={verdict.probability:.2f}  {verdict.claim[:56]}{extra}")
         outcome = "BLOCKED" if not blocked else "LET THROUGH"
         print(f"     >> gate verdict: {outcome}")
 
@@ -403,12 +416,14 @@ async def run_all(settings: Settings, *, live: bool) -> int:
             # Offline, the extractive fake cannot invent a figure, so scenario 3
             # asks it to. Live, the real model is left to hallucinate unaided.
             active_llm = llm
+            active_settings = settings
             if scenario.force_hallucination and not live:
                 from cribrix.clients.llm import FakeLLMClient
 
                 active_llm = FakeLLMClient(hallucinate=True)
+                active_settings = settings.model_copy(update={"evidence_threshold": 0.0})
             naive = await run_naive(scenario, active_llm)
-            guarded, response = await run_cribrix(scenario, jev, active_llm, settings)
+            guarded, response = await run_cribrix(scenario, jev, active_llm, active_settings)
             probe = await probe_verifier(scenario, jev, settings)
             print_scenario(index, scenario, naive, guarded, response, probe)
 
@@ -420,10 +435,12 @@ async def run_all(settings: Settings, *, live: bool) -> int:
                 blocked, _ = probe
                 ok = not blocked
                 if ok:
-                    print(
-                        "   >> note: this model did not hallucinate; "
-                        "the gate was verified directly instead."
+                    reason = (
+                        "triage refused before generation (no chunk states the answer)"
+                        if guarded.status == AnswerStatus.INSUFFICIENT_CONTEXT.value
+                        else "this model did not hallucinate"
                     )
+                    print(f"   >> note: {reason}; the gate was verified directly instead.")
             if not ok:
                 failures += 1
     finally:

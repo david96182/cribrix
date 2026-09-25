@@ -32,7 +32,9 @@ STATUS_COLOURS = {
     "CHITCHAT": CYAN,
     "INSUFFICIENT_CONTEXT": YELLOW,
     "NO_DOCUMENTS": YELLOW,
+    "DECLINED": YELLOW,
     "UNGROUNDED": RED,
+    "GENERATION_FAILED": RED,
     "VERIFIER_UNAVAILABLE": RED,
 }
 
@@ -76,8 +78,11 @@ def render(body: dict[str, Any]) -> None:
         print(f"  {paint('3 triage', DIM)}     kept {kept}/{len(scored)}")
         for item in scored:
             mark = paint("KEEP", GREEN) if item["kept"] else paint("drop", DIM)
-            text = item["chunk"]["content"].replace("\n", " ")[:62]
-            print(f"      [{mark}] {item['relevance']:.2f}  {text}")
+            text = item["chunk"]["content"].replace("\n", " ")[:52]
+            answers = item.get("answers")
+            signal = f" ans={answers:.2f}" if isinstance(answers, float) else ""
+            why = f"  {paint(item['drop_reason'], DIM)}" if item.get("drop_reason") else ""
+            print(f"      [{mark}] {item['relevance']:.2f}{signal}  {text}{why}")
 
     verdicts = trace.get("claim_verdicts") or []
     if verdicts:
@@ -86,7 +91,9 @@ def render(body: dict[str, Any]) -> None:
         print(f"  {paint('5 verify', DIM)}     groundedness {shown}")
         for verdict in verdicts:
             mark = paint("OK ", GREEN) if verdict["grounded"] else paint("BAD", RED)
-            print(f"      [{mark}] p={verdict['probability']:.2f}  {verdict['claim'][:58]}")
+            nums = verdict.get("unsupported_numbers") or []
+            extra = f"  numbers not in source: {nums}" if nums else ""
+            print(f"      [{mark}] p={verdict['probability']:.2f}  {verdict['claim'][:58]}{extra}")
 
     sources = body.get("sources") or []
     if sources:
@@ -96,6 +103,11 @@ def render(body: dict[str, Any]) -> None:
     if timings:
         parts = " ".join(f"{t['stage']}={t['duration_ms']:.0f}ms" for t in timings)
         print(f"  {paint('timing', DIM)}       {parts}  total={trace.get('total_ms', 0):.0f}ms")
+    if trace.get("jev_requests") is not None:
+        print(
+            f"  {paint('calls', DIM)}        jev={trace.get('jev_requests', 0)} "
+            f"llm={trace.get('llm_calls', 0)}"
+        )
 
     for note in trace.get("notes") or []:
         print(paint(f"  note         {note}", DIM))

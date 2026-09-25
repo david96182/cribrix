@@ -3,30 +3,34 @@
 The last line of defence: nothing reaches the user unless the context supports
 it.
 
-Why atomic verification is the default
---------------------------------------
-A single ``boolean(context, whole_answer)`` call is the obvious design and it
-is wrong in practice. Real answers are multi-claim — four sentences where three
-are grounded and one is invented. A holistic boolean collapses that to
-``False`` and discards a mostly-correct answer, so the system feels broken and
-users route around it.
+Design
+------
+**Atomic, but one request.** The draft is split into sentence-level claims and
+every claim becomes its own ``Noul`` question — all inside a *single* Jev
+request whose state is the evidence. Questions are evaluated independently and
+in parallel, so verifying ten claims costs roughly what verifying one does.
 
-Atomic mode splits the draft into sentence-level claims, verifies each
-independently and concurrently, and passes when the grounded fraction clears
-``groundedness_threshold``. That yields a *graded* signal the evaluator can
-report on, instead of a single bit.
+**Numbers are checked in code.** Jev's own documentation lists numeric
+comparison as a weak spot. Every number in a claim must literally appear in the
+evidence (after normalising "1,000", "99.95%", "five", "first"...). A claim
+that introduces a figure the evidence never states is ungrounded regardless of
+what the model says. This check can only make the gate stricter.
 
-Refusal passthrough
--------------------
-An honest "I don't have enough information" is not entailed by the context, so
-a naive verifier rejects it — and the system replaces a correct refusal with a
-generic error. Recognised refusal phrasings bypass the gate.
+**No silent bypasses.**
+
+* A draft is treated as a refusal only if *nothing but* refusal language
+  remains once contrastive clauses are split off. "The context doesn't say,
+  but it is 10%" is a refusal wrapper around a claim, and the claim is checked.
+* Short fragments ("It is 10%.", "Yes.") are never skipped. They are verified
+  with the user's question attached, so the model can judge what they assert.
+* An empty draft fails.
 """
 
 from __future__ import annotations
 
-import asyncio
 import re
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 
 from cribrix.clients.jev import JevClient, JevError
 from cribrix.observability import get_logger
@@ -39,65 +43,156 @@ logger = get_logger(__name__)
 _ABBREVIATIONS = r"(?<!\b[A-Z])(?<!\bapprox)(?<!\be\.g)(?<!\bi\.e)(?<!\bvs)(?<!\bNo)"
 _SENTENCE_SPLIT_RE = re.compile(rf"{_ABBREVIATIONS}(?<=[.!?])\s+(?=[A-Z0-9])")
 
-_REFUSAL_PATTERNS = (
-    "i don't have enough information",
-    "i do not have enough information",
-    "insufficient information",
-    "the context does not",
-    "the provided context does not",
-    "i cannot answer",
-    "i can't answer",
-    "not enough context",
+_REFUSAL_RE = re.compile(
+    r"\b(?:"
+    r"i (?:do not|don't) have (?:enough|sufficient) (?:information|context)"
+    r"|(?:insufficient|not enough) (?:information|context)"
+    r"|(?:the )?(?:provided |given )?(?:context|passages?|sources?|documents?) "
+    r"(?:does not|doesn't|do not|don't) (?:contain|specify|state|mention|say|include|provide)"
+    r"|(?:is|are) not (?:specified|stated|mentioned|provided|given|included) "
+    r"in the (?:context|passages?|sources?|provided|available|given)"
+    r"|(?:i|we) (?:cannot|can't|am unable to|are unable to|am not able to) "
+    r"(?:answer|determine|find|say|tell)"
+    r"|no information (?:is |was )?(?:available|provided|given)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Clause boundaries that commonly glue a claim onto a refusal.
+_CONTRAST_RE = re.compile(
+    r"\s*[;:]\s*|,?\s*\b(?:but|however|although|though|yet|nevertheless|nonetheless|"
+    r"that said|instead)\b,?\s*",
+    re.IGNORECASE,
 )
 
 MIN_CLAIM_CHARS = 12
-"""Fragments shorter than this ("Yes.", "Correct.") carry no verifiable
-proposition; verifying them produces noise, so they are skipped."""
+"""Fragments shorter than this rarely carry a self-contained proposition, so
+they are verified *with the question attached* rather than on their own."""
+
+_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+_WORD_NUMBERS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "fifteen": 15, "twenty": 20, "thirty": 30, "fifty": 50, "hundred": 100,
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "once": 1, "twice": 2, "single": 1, "half": 50, "dozen": 12,
+}  # fmt: skip
 
 
+@dataclass
 class VerificationResult:
     """Outcome of the groundedness gate."""
 
-    __slots__ = ("groundedness", "passed", "reason", "verdicts")
-
-    def __init__(
-        self,
-        passed: bool,
-        verdicts: list[ClaimVerdict],
-        groundedness: float | None,
-        reason: str = "",
-    ) -> None:
-        self.passed = passed
-        self.verdicts = verdicts
-        self.groundedness = groundedness
-        self.reason = reason
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return (
-            f"VerificationResult(passed={self.passed}, "
-            f"groundedness={self.groundedness}, reason={self.reason!r})"
-        )
+    passed: bool
+    verdicts: list[ClaimVerdict] = field(default_factory=list)
+    groundedness: float | None = None
+    reason: str = ""
+    declined: bool = False
+    """True when the draft was purely an admission that the context lacks the answer."""
 
 
-def is_refusal(answer: str) -> bool:
-    """True if the draft is an explicit admission of insufficient information."""
-    lowered = answer.lower()
-    return any(pattern in lowered for pattern in _REFUSAL_PATTERNS)
+# ---------------------------------------------------------------------------
+# Claim extraction
+# ---------------------------------------------------------------------------
 
 
 def split_claims(answer: str) -> list[str]:
-    """Decompose a draft into atomic, verifiable claims.
-
-    Sentence splitting is a pragmatic approximation of claim extraction: it is
-    cheap, deterministic, and captures most fabrications, which tend to arrive
-    as whole invented sentences. A dedicated claim-extraction model would be
-    the production upgrade; this keeps the dependency surface at zero.
-    """
+    """Split a draft into sentence-level claims. Nothing is discarded."""
     cleaned = answer.strip()
     if not cleaned:
         return []
-    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(cleaned)]
-    return [p for p in parts if len(p) >= MIN_CLAIM_CHARS]
+    return [p.strip() for p in _SENTENCE_SPLIT_RE.split(cleaned) if p.strip()]
+
+
+def is_refusal(text: str) -> bool:
+    """True if `text` contains refusal language."""
+    return bool(_REFUSAL_RE.search(text))
+
+
+def extract_claims(answer: str) -> tuple[list[str], bool]:
+    """Separate refusal language from the claims that must be verified.
+
+    Returns:
+        ``(claims, had_refusal)``. A draft with ``had_refusal`` and no claims
+        is a pure refusal.
+    """
+    claims: list[str] = []
+    had_refusal = False
+    for sentence in split_claims(answer):
+        if not is_refusal(sentence):
+            claims.append(sentence)
+            continue
+        had_refusal = True
+        for part in _CONTRAST_RE.split(sentence):
+            part = part.strip(" ,.")
+            # Anything that is not itself refusal language is an assertion.
+            if part and not is_refusal(part) and re.search(r"[A-Za-z0-9]", part):
+                claims.append(part)
+    return claims, had_refusal
+
+
+def contextualise(claim: str, question: str | None) -> str:
+    """Attach the question to fragments too short to stand alone."""
+    if question and len(claim) < MIN_CLAIM_CHARS:
+        return f"Asked '{question}', the answer was: {claim}"
+    return claim
+
+
+# ---------------------------------------------------------------------------
+# Deterministic numeric check
+# ---------------------------------------------------------------------------
+
+
+def _normalise_number(raw: str) -> str:
+    value = float(raw.replace(",", ""))
+    return f"{value:g}"
+
+
+def numbers_in(text: str, *, words: frozenset[str] | None = None) -> set[str]:
+    """All numbers in `text`, normalised ("1,000" == "1000", "five" == "5").
+
+    `words` restricts which number-words are recognised (default: all).
+    """
+    vocabulary = _WORD_NUMBERS.keys() if words is None else words
+    found = {_normalise_number(m) for m in _NUMBER_RE.findall(text) if m.strip(",")}
+    for word in re.findall(r"[a-z]+", text.lower()):
+        if word in vocabulary:
+            found.add(f"{_WORD_NUMBERS[word]:g}")
+    return found
+
+
+# On the *claim* side only unambiguous cardinals count: "one of the options",
+# "per second" or "a third party" are prose, and flagging them would make the
+# gate over-refuse. The evidence side recognises every number word, so a claim
+# saying "5 retries" is supported by evidence saying "five times".
+_CLAIM_NUMBER_WORDS = frozenset(
+    [
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "fifteen",
+        "twenty",
+        "thirty",
+        "fifty",
+        "hundred",
+        "twice",
+        "dozen",
+    ]
+)
+
+
+def unsupported_numbers(claim: str, evidence: str) -> list[str]:
+    """Numbers stated in `claim` that never appear in `evidence`."""
+    claimed = numbers_in(claim, words=_CLAIM_NUMBER_WORDS)
+    return sorted(claimed - numbers_in(evidence), key=float)
 
 
 def build_context(chunks: list[Chunk]) -> str:
@@ -110,31 +205,9 @@ def build_context(chunks: list[Chunk]) -> str:
     return "\n\n".join(chunk.content for chunk in chunks)
 
 
-async def _verify_claim(
-    jev: JevClient,
-    semaphore: asyncio.Semaphore,
-    context: str,
-    claim: str,
-    noul_threshold: float,
-) -> ClaimVerdict:
-    """Verify one claim; a failed call is treated as ungrounded (fail-closed).
-
-    Jev's ``noul`` primitive returns a *probability*, not a boolean, so the
-    threshold decision lives here rather than inside the client. Retaining the
-    raw probability on the verdict is what lets the trace show *how* confident
-    the rejection was instead of just that one happened.
-    """
-    async with semaphore:
-        try:
-            probability = await jev.grounded(source=context, claim=claim)
-        except JevError:
-            logger.warning("verification.claim_check_failed", exc_info=True)
-            probability = 0.0
-        return ClaimVerdict(
-            claim=claim,
-            grounded=probability >= noul_threshold,
-            probability=round(probability, 4),
-        )
+# ---------------------------------------------------------------------------
+# The gate
+# ---------------------------------------------------------------------------
 
 
 async def verify_answer(
@@ -142,11 +215,11 @@ async def verify_answer(
     chunks: list[Chunk],
     answer: str,
     *,
+    question: str | None = None,
     mode: str = "atomic",
     groundedness_threshold: float = 1.0,
     noul_threshold: float = 0.5,
     fail_open: bool = False,
-    max_concurrency: int = 16,
 ) -> VerificationResult:
     """Gate a draft answer on whether the context supports it.
 
@@ -154,48 +227,50 @@ async def verify_answer(
         jev: System-1 client.
         chunks: The triaged chunks that were given to the generator.
         answer: The draft response.
-        mode: ``"atomic"`` (per-sentence) or ``"holistic"`` (single check).
+        question: The user's question, used to give short fragments meaning.
+        mode: ``"atomic"`` (per-claim) or ``"holistic"`` (the whole draft as one claim).
         groundedness_threshold: Fraction of claims that must be grounded.
         noul_threshold: Minimum Noul probability for a claim to count as grounded.
         fail_open: If the verifier is unreachable, pass the answer through
             (flagged) instead of refusing. Default False = fail-closed.
-        max_concurrency: Bound on simultaneous in-flight boolean calls.
-
-    Returns:
-        A ``VerificationResult`` carrying the pass/fail decision, per-claim
-        verdicts and the groundedness ratio.
     """
-    # An explicit refusal is honest and must not be punished by the gate.
-    if is_refusal(answer):
-        return VerificationResult(True, [], None, reason="refusal_passthrough")
+    claims, had_refusal = extract_claims(answer)
+
+    if not claims:
+        if had_refusal:
+            # An honest, *pure* admission of ignorance is not a fabrication.
+            return VerificationResult(True, reason="generator_declined", declined=True)
+        return VerificationResult(False, groundedness=0.0, reason="empty_draft")
 
     # No evidence means nothing can be grounded. Never fail open here: this is
     # precisely the situation the system exists to catch.
     if not chunks:
-        return VerificationResult(False, [], 0.0, reason="no_context_to_verify_against")
+        return VerificationResult(False, groundedness=0.0, reason="no_context_to_verify_against")
 
     context = build_context(chunks)
-
     if mode == "holistic":
-        try:
-            probability = await jev.grounded(source=context, claim=answer)
-        except JevError:
-            return _on_verifier_error(fail_open)
-        grounded = probability >= noul_threshold
-        verdicts = [
-            ClaimVerdict(claim=answer, grounded=grounded, probability=round(probability, 4))
-        ]
-        return VerificationResult(grounded, verdicts, 1.0 if grounded else 0.0, reason="holistic")
+        claims = [" ".join(claims)]
+    to_check = [contextualise(c, question) for c in claims]
 
-    claims = split_claims(answer)
-    if not claims:
-        # Nothing substantive was asserted (e.g. "Yes."). Nothing to fabricate.
-        return VerificationResult(True, [], None, reason="no_verifiable_claims")
+    try:
+        result = await jev.verify_claims(context, to_check)
+    except JevError:
+        return _on_verifier_error(fail_open)
+    if len(result.probabilities) != len(to_check):
+        logger.error("verification.malformed_response")
+        return _on_verifier_error(fail_open)
 
-    semaphore = asyncio.Semaphore(max_concurrency)
-    verdicts = await asyncio.gather(
-        *(_verify_claim(jev, semaphore, context, claim, noul_threshold) for claim in claims)
-    )
+    verdicts: list[ClaimVerdict] = []
+    for claim, probability in zip(claims, result.probabilities, strict=True):
+        missing = unsupported_numbers(claim, context)
+        verdicts.append(
+            ClaimVerdict(
+                claim=claim,
+                grounded=probability >= noul_threshold and not missing,
+                probability=round(probability, 4),
+                unsupported_numbers=missing,
+            )
+        )
 
     grounded_count = sum(1 for v in verdicts if v.grounded)
     groundedness = grounded_count / len(verdicts)
@@ -203,18 +278,32 @@ async def verify_answer(
 
     logger.info(
         "verification.completed",
+        mode=mode,
         claims=len(verdicts),
         grounded=grounded_count,
         groundedness=round(groundedness, 4),
         passed=passed,
     )
-    return VerificationResult(passed, list(verdicts), groundedness, reason="atomic")
+    return VerificationResult(passed, verdicts, groundedness, reason=mode)
 
 
 def _on_verifier_error(fail_open: bool) -> VerificationResult:
     """Apply the configured verifier-outage policy."""
     if fail_open:
         logger.error("verification.unavailable_failing_open")
-        return VerificationResult(True, [], None, reason="verifier_unavailable_failed_open")
+        return VerificationResult(True, reason="verifier_unavailable_failed_open")
     logger.error("verification.unavailable_failing_closed")
-    return VerificationResult(False, [], None, reason="verifier_unavailable")
+    return VerificationResult(False, reason="verifier_unavailable")
+
+
+__all__: Sequence[str] = (
+    "VerificationResult",
+    "build_context",
+    "contextualise",
+    "extract_claims",
+    "is_refusal",
+    "numbers_in",
+    "split_claims",
+    "unsupported_numbers",
+    "verify_answer",
+)

@@ -7,9 +7,17 @@ pipeline depending on Protocols rather than concrete clients.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
+
 import pytest
 
-from cribrix.clients.jev import FakeJevClient
+from cribrix.clients.jev import (
+    FakeJevClient,
+    GroundingResult,
+    JevError,
+    PassageAssessment,
+    RouteDecision,
+)
 from cribrix.clients.llm import FakeLLMClient
 from cribrix.config import Settings
 from cribrix.pipeline.orchestrator import RAGPipeline
@@ -22,11 +30,8 @@ def settings() -> Settings:
     """Default test configuration: strict thresholds, mock clients."""
     return Settings(
         database_url="postgresql+asyncpg://cribrix:cribrix@localhost:5432/cribrix",  # type: ignore[arg-type]
-        # 0.65 rather than 0.7: Jev's Score primitive is ordinal, so normalised
-        # values land on rubric steps (0, 1/3, 2/3, 1). A 0.7 threshold sits
-        # just above the 2/3 step and would silently reject partial matches.
-        # Threshold choice must respect the rubric's granularity.
-        relevance_threshold=0.65,
+        relevance_threshold=0.5,
+        evidence_threshold=0.5,
         min_chunks_required=1,
         retrieval_top_k=10,
         max_chunks_to_llm=5,
@@ -99,3 +104,51 @@ def pipeline(
         retriever=InMemoryRetriever(chunks),
         settings=settings,
     )
+
+
+class ScriptedJev:
+    """Programmable Jev double for stage-level tests.
+
+    Each operation is driven by a callable (or a fixed value), and every call
+    is recorded so tests can assert on what the pipeline actually asked.
+    """
+
+    def __init__(
+        self,
+        *,
+        route: RouteDecision | None = None,
+        assess: Callable[[str, str], PassageAssessment] | None = None,
+        verify: Callable[[str], float] | None = None,
+        fail: set[str] | None = None,
+    ) -> None:
+        self._route = route or RouteDecision("SEARCH", 1.0, {"SEARCH": 1.0, "CHITCHAT": 0.0})
+        self._assess = assess or (lambda q, p: PassageAssessment(1.0, 1.0, 1.0, 0.0))
+        self._verify = verify or (lambda claim: 0.98)
+        self._fail = fail or set()
+        self.route_calls: list[tuple[str, dict[str, str]]] = []
+        self.assessed: list[str] = []
+        self.verify_calls: list[list[str]] = []
+
+    async def route(self, message: str, options: dict[str, str]) -> RouteDecision:
+        self.route_calls.append((message, options))
+        if "route" in self._fail:
+            raise JevError("route down")
+        return self._route
+
+    async def assess_passage(self, question: str, passage: str) -> PassageAssessment:
+        self.assessed.append(passage)
+        if "assess" in self._fail or passage in self._fail:
+            raise JevError("assess down")
+        return self._assess(question, passage)
+
+    async def verify_claims(self, source: str, claims: Sequence[str]) -> GroundingResult:
+        self.verify_calls.append(list(claims))
+        if "verify" in self._fail:
+            raise JevError("verify down")
+        return GroundingResult([self._verify(c) for c in claims])
+
+    async def health(self) -> bool:
+        return not self._fail
+
+    async def aclose(self) -> None:
+        return None
