@@ -76,14 +76,14 @@ eval-sweep: $(VENV) ## Sweep triage thresholds over the recorded live signals (n
 
 .PHONY: lint
 lint: $(VENV) ## Lint and type-check
-	$(RUFF) check cribrix tests
-	$(RUFF) format --check cribrix tests
+	$(RUFF) check cribrix tests scripts
+	$(RUFF) format --check cribrix tests scripts
 	$(MYPY) cribrix
 
 .PHONY: fmt
 fmt: $(VENV) ## Auto-format and apply safe lint fixes
-	$(RUFF) check --fix cribrix tests
-	$(RUFF) format cribrix tests
+	$(RUFF) check --fix cribrix tests scripts
+	$(RUFF) format cribrix tests scripts
 
 .PHONY: run
 run: $(VENV) ## Run the API locally with hot reload

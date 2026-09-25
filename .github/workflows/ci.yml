@@ -24,8 +24,8 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -e ".[dev]"
-      - run: ruff check cribrix tests
-      - run: ruff format --check cribrix tests
+      - run: ruff check cribrix tests scripts
+      - run: ruff format --check cribrix tests scripts
       - run: mypy cribrix
 
   test:
@@ -34,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
