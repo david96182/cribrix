@@ -8,6 +8,7 @@ reconstructs the full decision path for any request.
 from __future__ import annotations
 
 import logging
+import sys
 import time
 import uuid
 from collections.abc import Iterator
@@ -46,7 +47,11 @@ def _inject_request_id(
 
 def configure_logging(level: str = "INFO", json_output: bool = True) -> None:
     """Configure structlog + stdlib logging. Safe to call once at startup."""
-    logging.basicConfig(format="%(message)s", level=getattr(logging, level.upper(), logging.INFO))
+    logging.basicConfig(
+        format="%(message)s",
+        level=getattr(logging, level.upper(), logging.INFO),
+        stream=sys.stderr,
+    )
 
     renderer: structlog.types.Processor = (
         structlog.processors.JSONRenderer()
@@ -67,7 +72,8 @@ def configure_logging(level: str = "INFO", json_output: bool = True) -> None:
         wrapper_class=structlog.make_filtering_bound_logger(
             getattr(logging, level.upper(), logging.INFO)
         ),
-        logger_factory=structlog.PrintLoggerFactory(),
+        # stderr, so CLI output on stdout (reports, --json) stays machine-readable.
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
         cache_logger_on_first_use=True,
     )
 

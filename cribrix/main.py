@@ -204,7 +204,7 @@ async def ingest_endpoint(
     bad = [c.document_id for c in payload.chunks if len(c.embedding) != settings.embedding_dim]
     if bad:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,  # literal: the named constant differs across Starlette versions
             detail=(
                 f"embedding dimension mismatch for documents {sorted(set(bad))}; "
                 f"expected {settings.embedding_dim}"
