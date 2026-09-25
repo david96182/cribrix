@@ -55,18 +55,24 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # API keys, model names and provider settings. Optional so a fresh clone
+    # without a .env still starts (in offline fake mode).
+    env_file:
+      - path: .env
+        required: false
     environment:
       CRIBRIX_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-cribrix}:${POSTGRES_PASSWORD:-cribrix}@db:5432/${POSTGRES_DB:-cribrix}
       CRIBRIX_ENV: docker
       CRIBRIX_LOG_LEVEL: ${CRIBRIX_LOG_LEVEL:-INFO}
       CRIBRIX_LOG_JSON: ${CRIBRIX_LOG_JSON:-true}
-      CRIBRIX_JEV_MODE: ${CRIBRIX_JEV_MODE:-mock}
-      CRIBRIX_LLM_MODE: ${CRIBRIX_LLM_MODE:-mock}
-      CRIBRIX_JEV_API_KEY: ${CRIBRIX_JEV_API_KEY:-}
-      CRIBRIX_RELEVANCE_THRESHOLD: ${CRIBRIX_RELEVANCE_THRESHOLD:-0.7}
+      # Model settings come from .env (env_file below); defaults are offline fakes.
+      CRIBRIX_JEV_MODE: ${CRIBRIX_JEV_MODE:-fake}
+      CRIBRIX_LLM_PROVIDER: ${CRIBRIX_LLM_PROVIDER:-fake}
+      CRIBRIX_RELEVANCE_THRESHOLD: ${CRIBRIX_RELEVANCE_THRESHOLD:-0.5}
+      CRIBRIX_EVIDENCE_THRESHOLD: ${CRIBRIX_EVIDENCE_THRESHOLD:-0.5}
       CRIBRIX_RETRIEVAL_TOP_K: ${CRIBRIX_RETRIEVAL_TOP_K:-20}
       CRIBRIX_VERIFICATION_MODE: ${CRIBRIX_VERIFICATION_MODE:-atomic}
-      CRIBRIX_EMBEDDING_DIM: ${CRIBRIX_EMBEDDING_DIM:-1536}
+      CRIBRIX_EMBEDDING_DIM: ${CRIBRIX_EMBEDDING_DIM:-384}
     ports:
       - "${CRIBRIX_API_HOST:-127.0.0.1}:${CRIBRIX_API_PORT:-8000}:8000"
     healthcheck:
