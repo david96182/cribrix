@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Index, Integer, MetaData, String, Text, func, select, text
+from sqlalchemy import Index, Integer, MetaData, String, Text, delete, func, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -280,20 +280,20 @@ async def delete_all_chunks(session: AsyncSession) -> int:
     Uses DELETE rather than TRUNCATE so it participates in the surrounding
     transaction and rolls back cleanly on error.
     """
-    from sqlalchemy import delete
-
     result = await session.execute(delete(DocumentChunk))
     # CursorResult exposes rowcount; the generic Result stub does not.
     return int(getattr(result, "rowcount", 0) or 0)
 
 
 async def delete_document(session: AsyncSession, document_id: str) -> int:
-    """Delete every chunk belonging to `document_id`; returns rows removed."""
-    stmt = select(DocumentChunk).where(DocumentChunk.document_id == document_id)
-    rows = (await session.execute(stmt)).scalars().all()
-    for row in rows:
-        await session.delete(row)
-    return len(rows)
+    """Delete every chunk belonging to `document_id`; returns rows removed.
+
+    A single bulk DELETE: loading each row into the session and deleting it
+    individually would be one round-trip per chunk.
+    """
+    stmt = delete(DocumentChunk).where(DocumentChunk.document_id == document_id)
+    result = await session.execute(stmt)
+    return int(getattr(result, "rowcount", 0) or 0)
 
 
 # Process-wide instance, wired into FastAPI's lifespan.

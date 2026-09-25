@@ -48,8 +48,15 @@ async def database():
     db.connect()
     try:
         await db.create_schema()
-    except (SQLAlchemyError, OSError) as exc:
+    except (SQLAlchemyError, OSError, ConnectionError) as exc:
+        await db.disconnect()
         pytest.skip(f"PostgreSQL+pgvector not available: {exc}")
+    except Exception as exc:
+        # e.g. asyncpg.InvalidPasswordError: something else owns the port.
+        await db.disconnect()
+        if type(exc).__module__.startswith("asyncpg"):
+            pytest.skip(f"PostgreSQL at {url} rejected the connection: {exc}")
+        raise
 
     # Start from an empty corpus regardless of what previous runs left behind.
     async with db.session() as session:
