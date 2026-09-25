@@ -92,6 +92,7 @@ PROVIDER_DEFAULTS: dict[str, tuple[str, str]] = {
     "anthropic": ("https://api.anthropic.com/v1", "claude-sonnet-4-20250514"),
     "together": ("https://api.together.xyz/v1", "meta-llama/Llama-3.3-70B-Instruct-Turbo"),
     "groq": ("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"),
+    "xai": ("https://api.x.ai/v1", "grok-4.20-0309-non-reasoning"),
     "ollama": ("http://localhost:11434/v1", "llama3.2"),
     "custom": ("", ""),
 }

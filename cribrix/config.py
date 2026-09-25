@@ -175,7 +175,7 @@ class Settings(BaseSettings):
 
     # --- LLM (System 2) -----------------------------------------------------
     llm_provider: Literal[
-        "fake", "openai", "anthropic", "openrouter", "together", "groq", "ollama", "custom"
+        "fake", "openai", "anthropic", "openrouter", "together", "groq", "xai", "ollama", "custom"
     ] = Field(
         default="fake",
         description=(

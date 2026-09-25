@@ -349,7 +349,7 @@ def test_factory_returns_fake_by_default() -> None:
     assert isinstance(build_llm_client(Settings(llm_provider="fake")), FakeLLMClient)
 
 
-@pytest.mark.parametrize("provider", ["openai", "openrouter", "together", "groq", "ollama"])
+@pytest.mark.parametrize("provider", ["openai", "openrouter", "together", "groq", "xai", "ollama"])
 def test_openai_compatible_providers_share_one_client(provider: str) -> None:
     """Five providers, one implementation — they share a wire format."""
     client = build_llm_client(Settings(llm_provider=provider, llm_api_key="k"))
